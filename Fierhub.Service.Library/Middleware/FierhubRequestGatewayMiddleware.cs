@@ -14,7 +14,7 @@ namespace Fierhub.Service.Library.Middleware
             try
             {
                 // By pass anonymous
-                if (_routeValidator.TestAnonymous(_next, context) || _routeValidator.TestRoute(_next, context))
+                if (_routeValidator.Test(context))
                 {
                     await _next(context);
                     return;
