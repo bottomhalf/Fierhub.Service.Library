@@ -4,8 +4,11 @@ using Fierhub.Service.Library.Middleware.Service;
 using Fierhub.Service.Library.Model;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -14,33 +17,66 @@ using System.Text;
 
 namespace Fierhub.Service.Library.Service
 {
+    /// <summary>
+    /// Thread-safe singleton registry for FierHub services and configuration.
+    /// </summary>
     public class FierHubRegistry
     {
-        private WebApplicationBuilder _builder;
-        public static FierHubRegistry Builder(WebApplicationBuilder builder)
+        private static readonly object _lock = new object();
+        private static FierHubRegistry _instance;
+
+        private readonly WebApplicationBuilder _builder;
+        private readonly ILogger<FierHubRegistry> _logger;
+        private readonly FierhubServiceRequest _httpServiceRequest;
+
+        public static FierHubRegistry Init(WebApplicationBuilder builder)
         {
-            return new FierHubRegistry(builder);
+            if (_instance == null)
+            {
+                lock (_lock)
+                {
+                    if (_instance == null)
+                    {
+                        _instance = new FierHubRegistry(builder);
+                    }
+                }
+            }
+            return _instance;
+        }
+
+        public static FierHubRegistry Instance => _instance;
+
+        public static void ResetInstanceForTesting()
+        {
+            lock (_lock)
+            {
+                _instance = null;
+            }
+        }
+
+        public FierHubConfig Config => FierHubConfig.Instance();
+
+        public FierHubRegistry RegisterFierAuth()
+        {
+            return this;
         }
 
         private FierHubRegistry(WebApplicationBuilder builder)
         {
-            _builder = builder;
+            _builder = builder ?? throw new ArgumentNullException(nameof(builder));
 
             _builder.Services.AddHttpClient();
-            _builder.Services.AddHttpContextAccessor();
-            _builder.Services.AddScoped<UserSession>();
-            _builder.Services.AddSingleton<RouteValidator>();
-            _builder.Services.AddScoped<FierhubGatewayFilter>();
-            _builder.Services.AddScoped<FierhubServiceFilter>();
-            _builder.Services.AddScoped<FierhubCommonService>();
+            _builder.Services.TryAddSingleton<IHttpContextAccessor, HttpContextAccessor>();
+            _builder.Services.TryAddScoped<UserSession>();
+            _builder.Services.TryAddSingleton<RouteValidator>();
+            _builder.Services.TryAddScoped<FierhubGatewayFilter>();
+            _builder.Services.TryAddScoped<FierhubServiceFilter>();
+            _builder.Services.TryAddScoped<FierhubCommonService>();
 
-            _builder.Services.AddSingleton<FierhubServiceRequest>();
-            _builder.Services.AddSingleton(x =>
-            {
-                return FierHubConfig.Instance();
-            });
+            _builder.Services.TryAddSingleton<FierhubServiceRequest>();
+            _builder.Services.TryAddSingleton(x => FierHubConfig.Instance());
 
-            _builder.Services.AddScoped<IFierHubService, FierHubService>(x =>
+            _builder.Services.TryAddScoped<IFierHubService>(x =>
             {
                 var httpServiceRequest = x.GetRequiredService<FierhubServiceRequest>();
                 var fierHubConfig = x.GetRequiredService<FierHubConfig>();
@@ -48,121 +84,238 @@ namespace Fierhub.Service.Library.Service
                 return new FierHubService(httpServiceRequest, fierHubConfig);
             });
 
+            var serviceProvider = _builder.Services.BuildServiceProvider();
+            _logger = serviceProvider.GetService<ILogger<FierHubRegistry>>()
+                      ?? LoggerFactory.Create(b => b.AddConsole()).CreateLogger<FierHubRegistry>();
+            _httpServiceRequest = serviceProvider.GetRequiredService<FierhubServiceRequest>();
+
+            _logger.LogInformation("[FierHub] Initializing FierHubRegistry singleton instance...");
+
             ConfigureFierhub();
-            // RegisterJWTTokenService(fierHubConfig.Secrets.FirstOrDefault(x => x.IsPrimary).Key);
-            // RegisterJsonHandler();
         }
 
         private void ConfigureFierhub()
         {
-            var serviceProvider = _builder.Services.BuildServiceProvider();
-            var httpServiceRequest = serviceProvider.GetRequiredService<FierhubServiceRequest>();
+            _logger.LogInformation("[FierHub] Reading application configuration for FierHub settings...");
 
-            var fierHubConfigInstance = FierHubConfig.Instance();
+            string fierhubToken = _builder.Configuration["FierHub:Token"]
+                ?? _builder.Configuration.GetSection("FierHub")?["Token"]
+                ?? _builder.Configuration.GetSection("FireHub")?["Token"];
 
-            FierHubConfig fierHubConfig = _builder.Configuration.GetSection("FierHub").Get<FierHubConfig>() ?? new FierHubConfig();
-
-            var fierHubSection = _builder.Configuration.GetSection("FierHub");
-            if (fierHubSection.Exists())
+            if (string.IsNullOrWhiteSpace(fierhubToken))
             {
-                foreach (var child in fierHubSection.GetChildren())
+                var localConfig = _builder.Configuration.GetSection("FierHub").Get<FierHubConfig>();
+                if (localConfig != null && !string.IsNullOrWhiteSpace(localConfig.Token))
                 {
-                    if (!fierHubConfig.AdditionalConfiguration.ContainsKey(child.Key) &&
-                        !IsStandardFierHubProperty(child.Key))
+                    fierhubToken = localConfig.Token;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(fierhubToken))
+            {
+                _logger.LogInformation("[FierHub] FierHub token found in configuration. Triggering download and FierHubConfig initialization...");
+                try
+                {
+                    ReadConfigurationFile(fierhubToken);
+                    _logger.LogInformation("[FierHub] Configuration download and FierHubConfig creation completed successfully.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "[FierHub] Failed to download or initialize FierHubConfig during singleton creation: {Message}", ex.Message);
+                    throw;
+                }
+            }
+            else
+            {
+                _logger.LogWarning("[FierHub] No FierHub token found in configuration during FierHubRegistry creation. FierHubConfig singleton initialized with default state.");
+            }
+        }
+
+        public FierHubConfig ReadConfigurationFile(string fierhubToken)
+        {
+            return ReadConfigurationFileAsync(fierhubToken).ConfigureAwait(false).GetAwaiter().GetResult();
+        }
+
+        public async Task<FierHubConfig> ReadConfigurationFileAsync(string fierhubToken)
+        {
+            if (string.IsNullOrWhiteSpace(fierhubToken))
+            {
+                _logger?.LogError("[FierHub] ReadConfigurationFile aborted: FierhubToken is null or whitespace.");
+                throw new ArgumentException("FierhubToken cannot be null or empty.", nameof(fierhubToken));
+            }
+
+            _logger?.LogInformation("[FierHub] ReadConfigurationFile started for token: {TokenPreview}...",
+                fierhubToken.Length > 8 ? fierhubToken.Substring(0, 4) + "****" : "****");
+
+            var payload = new
+            {
+                accessToken = fierhubToken
+            };
+
+            const string endpoint = "https://www.fierhub.com/api/fileContent/readConfigurationFile";
+            _logger?.LogInformation("[FierHub] Sending POST request to {Endpoint}...", endpoint);
+
+            var serviceRequest = _httpServiceRequest;
+            if (serviceRequest == null)
+            {
+                var sp = _builder?.Services.BuildServiceProvider();
+                serviceRequest = sp?.GetService<FierhubServiceRequest>();
+                if (serviceRequest == null)
+                {
+                    throw new InvalidOperationException("FierhubServiceRequest is not available.");
+                }
+            }
+
+            var responseModel = await serviceRequest.PostRequestAsync<ResponseModel>(
+                endpoint,
+                JsonConvert.SerializeObject(payload)
+            ).ConfigureAwait(false);
+
+            if (responseModel == null)
+            {
+                _logger?.LogError("[FierHub] POST request to {Endpoint} returned null response.", endpoint);
+                throw new InvalidOperationException("FierHub server returned null response.");
+            }
+
+            if (responseModel.statusCode != 200)
+            {
+                _logger?.LogError("[FierHub] POST request failed with status code {StatusCode}. Message: {Message}",
+                    responseModel.statusCode, responseModel.message);
+                throw new InvalidOperationException($"Fierhub Datasource must contain files, Please register with https://www.fierhub.com register and follow the step. Status: {responseModel.statusCode}. Message: {responseModel.message}");
+            }
+
+            _logger?.LogInformation("[FierHub] Configuration successfully downloaded (Status 200). Parsing JSON payload...");
+
+            string responseString = responseModel.responseBody is string str
+                ? str
+                : JsonConvert.SerializeObject(responseModel.responseBody);
+
+            if (string.IsNullOrWhiteSpace(responseString))
+            {
+                _logger?.LogWarning("[FierHub] Downloaded response body is empty.");
+                return FierHubConfig.Instance();
+            }
+
+            var rootObj = JObject.Parse(responseString);
+            var targetObj = rootObj["FierHub"] as JObject ?? rootObj["fierhub"] as JObject ?? rootObj;
+
+            var fierHubConfig = new FierHubConfig
+            {
+                Token = fierhubToken,
+                IsReady = true
+            };
+
+            // 1. Authorize (Optional)
+            if (targetObj["Authorize"] != null)
+            {
+                fierHubConfig.Authorize = targetObj["Authorize"].ToObject<FierHubConfig.AuthorizeModel>() ?? new FierHubConfig.AuthorizeModel();
+                _logger?.LogInformation("[FierHub] Authorize routes configured ({Count} route(s)).",
+                    fierHubConfig.Authorize?.Routes?.Count ?? 0);
+            }
+            else
+            {
+                _logger?.LogInformation("[FierHub] Authorize not present in configuration (optional).");
+            }
+
+            // 2. JwtSecret (Optional)
+            if (targetObj["JwtSecret"] != null)
+            {
+                fierHubConfig.JwtSecret = targetObj["JwtSecret"].ToObject<TokenRequestBody>();
+                if (fierHubConfig.JwtSecret != null)
+                {
+                    fierHubConfig.JwtSecret.IsPrimary = true;
+                    _logger?.LogInformation("[FierHub] JwtSecret configured (Issuer: {Issuer}, Audiance: {Audiance}, Expiry: {Expiry}s).",
+                        fierHubConfig.JwtSecret.Issuer, fierHubConfig.JwtSecret.Audiance, fierHubConfig.JwtSecret.ExpiryTimeInSeconds);
+                }
+            }
+            else
+            {
+                _logger?.LogInformation("[FierHub] JwtSecret not present in configuration (optional).");
+            }
+
+            // 3. ConnectionStrings (Optional)
+            if (targetObj["ConnectionStrings"] != null)
+            {
+                fierHubConfig.ConnectionStrings = targetObj["ConnectionStrings"].ToObject<Dictionary<string, string>>()
+                    ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                _logger?.LogInformation("[FierHub] ConnectionStrings configured ({Count} item(s)).",
+                    fierHubConfig.ConnectionStrings.Count);
+            }
+            else
+            {
+                _logger?.LogInformation("[FierHub] ConnectionStrings not present in configuration (optional).");
+            }
+
+            // 4. KafkaServerDetail (Optional)
+            if (targetObj["KafkaServerDetail"] != null)
+            {
+                fierHubConfig.KafkaServerDetail = targetObj["KafkaServerDetail"].ToObject<KafkaServerDetailModel>();
+                _logger?.LogInformation("[FierHub] KafkaServerDetail configured (BootstrapServers: {Servers}, EnableAutoCommit: {AutoCommit}).",
+                    fierHubConfig.KafkaServerDetail?.BootstrapServers, fierHubConfig.KafkaServerDetail?.EnableAutoCommit);
+            }
+            else
+            {
+                _logger?.LogInformation("[FierHub] KafkaServerDetail not present in configuration (optional).");
+            }
+
+            // 5. Additional details (e.g. Credential, Test, etc.) outside the given details
+            // Stored in Dictionary<string, string> where Key = object name, Value = string json
+            foreach (var prop in targetObj.Properties())
+            {
+                if (!FierHubConfig.IsStandardProperty(prop.Name))
+                {
+                    string stringJson = prop.Value != null
+                        ? (prop.Value.Type == JTokenType.String ? prop.Value.ToString() : prop.Value.ToString(Formatting.None))
+                        : null;
+
+                    fierHubConfig.AdditionalDetails[prop.Name] = stringJson;
+                    _logger?.LogInformation("[FierHub] Additional detail stored in Dictionary<string, string>: '{Key}'", prop.Name);
+                }
+            }
+
+            // If target was wrapped in FierHub/fierhub, capture any properties outside FierHub
+            if (targetObj != rootObj)
+            {
+                foreach (var prop in rootObj.Properties())
+                {
+                    if (!string.Equals(prop.Name, "FierHub", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(prop.Name, "fierhub", StringComparison.OrdinalIgnoreCase) &&
+                        !FierHubConfig.IsStandardProperty(prop.Name) &&
+                        !fierHubConfig.AdditionalDetails.ContainsKey(prop.Name))
                     {
-                        var token = ConfigurationSectionToJToken(child);
-                        if (token != null)
-                        {
-                            fierHubConfig.AdditionalConfiguration[child.Key] = token;
-                        }
+                        string stringJson = prop.Value != null
+                            ? (prop.Value.Type == JTokenType.String ? prop.Value.ToString() : prop.Value.ToString(Formatting.None))
+                            : null;
+
+                        fierHubConfig.AdditionalDetails[prop.Name] = stringJson;
+                        _logger?.LogInformation("[FierHub] Additional root detail stored in Dictionary<string, string>: '{Key}'", prop.Name);
                     }
                 }
             }
 
-            if (!string.IsNullOrEmpty(fierHubConfig.Token))
-                fierHubConfig = ReadConfigurationFile(fierHubConfig.Token, httpServiceRequest);
+            // Update thread-safe singleton FierHubConfig
+            var singletonInstance = FierHubConfig.Instance();
+            singletonInstance.Token = fierHubConfig.Token;
+            singletonInstance.JwtSecret = fierHubConfig.JwtSecret;
+            singletonInstance.Authorize = fierHubConfig.Authorize;
+            singletonInstance.ConnectionStrings = fierHubConfig.ConnectionStrings;
+            singletonInstance.KafkaServerDetail = fierHubConfig.KafkaServerDetail;
+            singletonInstance.AdditionalDetails = fierHubConfig.AdditionalDetails;
+            singletonInstance.IsReady = true;
 
-            if (fierHubConfig.ConfiguredFromFierhub)
+            FierHubConfig.SetInstance(singletonInstance);
+
+            // Register JWT authentication service if primary key is available
+            if (singletonInstance.JwtSecret != null && !string.IsNullOrEmpty(singletonInstance.JwtSecret.Key))
             {
-                fierHubConfig = GetConfigurationDetailFromFierhub(
-                        httpServiceRequest,
-                        fierHubConfig.Configuration?.Token ?? fierHubConfigInstance.Configuration?.Token,
-                        fierHubConfig.Configuration?.FileName ?? fierHubConfigInstance.Configuration?.FileName
-                    );
+                var primaryKey = singletonInstance.JwtSecret.Key;
+                _logger?.LogInformation("[FierHub] Registering JWT Token Service with primary signing key.");
+                RegisterJWTTokenService(primaryKey);
             }
 
-            if (fierHubConfig.JwtSecret != null)
-            {
-                fierHubConfig.JwtSecret.IsPrimary = true;
-                fierHubConfig.Secrets = new List<TokenRequestBody> { fierHubConfig.JwtSecret };
-            }
+            _logger?.LogInformation("[FierHub] FierHubConfig singleton instance successfully initialized.");
 
-            // ConfigurationFierhub(fierHubConfig, httpServiceRequest);
-            // LoadJwtSecret(fierHubConfig, httpServiceRequest);
-
-            if (fierHubConfig.Secrets != null && fierHubConfig.Secrets.Any(x => x.IsPrimary))
-            {
-                RegisterJWTTokenService(fierHubConfig.Secrets.FirstOrDefault(x => x.IsPrimary).Key);
-            }
-
-            fierHubConfigInstance.Initialize(
-                fierHubConfig.Datasource,
-                fierHubConfig.Authorize,
-                fierHubConfig.Configuration,
-                fierHubConfig.Connections,
-                fierHubConfig.Secrets,
-                fierHubConfig.ConnectionStrings,
-                fierHubConfig.AdditionalConfiguration
-            );
-
-            fierHubConfigInstance.Token = fierHubConfig.Token;
-            fierHubConfigInstance.JwtSecret = fierHubConfig.JwtSecret;
-            fierHubConfigInstance.ConfigurationGateway = fierHubConfig.ConfigurationGateway;
-            fierHubConfigInstance.ConfigurationService = fierHubConfig.ConfigurationService;
-            fierHubConfigInstance.AppSettingFiles = fierHubConfig.AppSettingFiles;
-            fierHubConfigInstance.Records = fierHubConfig.Records;
-            fierHubConfigInstance.UseDbConfigFromFierhub = fierHubConfig.UseDbConfigFromFierhub;
-            fierHubConfigInstance.UseTokenSecretFromFierhub = fierHubConfig.UseTokenSecretFromFierhub;
-            fierHubConfigInstance.ConfiguredFromFierhub = fierHubConfig.ConfiguredFromFierhub;
-            fierHubConfigInstance.IsFierhubDataLoadingCompleted = fierHubConfig.IsFierhubDataLoadingCompleted;
-
-            fierHubConfig = null;
-        }
-
-        private void ConfigurationFierhub(FierHubConfig fierHubConfig, FierhubServiceRequest httpServiceRequest)
-        {
-            if (fierHubConfig.Datasource == null && fierHubConfig.Connections == null)
-            {
-                throw new Exception("Connection not found your fierhub configuration.");
-            }
-
-            fierHubConfig.ConfigureUses(httpServiceRequest);
-        }
-
-        private void LoadJwtSecret(FierHubConfig fierHubConfig, FierhubServiceRequest httpServiceRequest)
-        {
-            if (fierHubConfig.Configuration.FileName != null)
-            {
-                var payload = new
-                {
-                    accessToken = fierHubConfig.Configuration.Token,
-                    fileName = fierHubConfig.Configuration.FileName
-                };
-
-                var responseModel = httpServiceRequest.PostRequestAsync<ResponseModel>(
-                    "https://www.fierhub.com/api/fileContent/readFile",
-                    JsonConvert.SerializeObject(payload)
-                ).ConfigureAwait(false).GetAwaiter().GetResult();
-
-                var tokenRequestBody = JsonConvert.DeserializeObject<TokenRequestBody>((string)responseModel!.responseBody!)!;
-                if (tokenRequestBody == null)
-                {
-                    throw new Exception("Token detail not found in fierhub server.");
-                }
-
-                if (fierHubConfig.Secrets == null) fierHubConfig.Secrets = new List<TokenRequestBody>();
-                fierHubConfig.Secrets.Add(tokenRequestBody);
-            }
+            return singletonInstance;
         }
 
         private FierHubConfig GetConfigurationDetailFromFierhub(FierhubServiceRequest fierhubServiceRequest, string accessToken, string fileName)
@@ -185,125 +338,7 @@ namespace Fierhub.Service.Library.Service
                 throw new Exception("Fail to get the Fierhub configuration from server.");
             }
 
-            try
-            {
-                var jsonObj = JObject.Parse(responseJson);
-                if (jsonObj["FierHub"] is JObject innerFierHub)
-                {
-                    foreach (var prop in innerFierHub.Properties())
-                    {
-                        if (!fierHubConfig.AdditionalConfiguration.ContainsKey(prop.Name))
-                        {
-                            fierHubConfig.AdditionalConfiguration[prop.Name] = prop.Value;
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // Fallback to directly deserialized object
-            }
-
             return fierHubConfig;
-        }
-
-        private FierHubConfig ReadConfigurationFile(string token, FierhubServiceRequest httpServiceRequest)
-        {
-            var payload = new
-            {
-                accessToken = token,
-            };
-
-            var responseModel = httpServiceRequest.PostRequestAsync<ResponseModel>(
-                    "https://www.fierhub.com/api/fileContent/readConfigurationFile",
-                    JsonConvert.SerializeObject(payload)
-                ).ConfigureAwait(false).GetAwaiter().GetResult();
-
-            if (responseModel == null || responseModel.statusCode != 200)
-            {
-                throw new Exception("Fierhub Datasource must contain files, Please register with https://www.fierhub.com register and follow the step.");
-            }
-
-            var responseString = (string)responseModel!.responseBody!;
-            var jsonObj = JObject.Parse(responseString);
-            var fierHubToken = jsonObj["FierHub"] ?? jsonObj["fierhub"];
-
-            FierHubConfig fierHubConfig;
-            if (fierHubToken != null && fierHubToken.Type == JTokenType.Object)
-            {
-                fierHubConfig = fierHubToken.ToObject<FierHubConfig>() ?? new FierHubConfig();
-
-                // Capture any additional sections at the root level outside "FierHub"
-                foreach (var prop in jsonObj.Properties())
-                {
-                    if (!string.Equals(prop.Name, "FierHub", StringComparison.OrdinalIgnoreCase))
-                    {
-                        fierHubConfig.AdditionalConfiguration[prop.Name] = prop.Value;
-                    }
-                }
-            }
-            else
-            {
-                fierHubConfig = JsonConvert.DeserializeObject<FierHubConfig>(responseString) ?? new FierHubConfig();
-            }
-
-            return fierHubConfig;
-        }
-
-        private static bool IsStandardFierHubProperty(string key)
-        {
-            return _standardProperties.Contains(key);
-        }
-
-        private static readonly HashSet<string> _standardProperties = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            nameof(FierHubConfig.Token),
-            nameof(FierHubConfig.JwtSecret),
-            nameof(FierHubConfig.Datasource),
-            nameof(FierHubConfig.Authorize),
-            nameof(FierHubConfig.ConfigurationGateway),
-            nameof(FierHubConfig.ConfigurationService),
-            nameof(FierHubConfig.Configuration),
-            nameof(FierHubConfig.Connections),
-            nameof(FierHubConfig.Secrets),
-            nameof(FierHubConfig.AppSettingFiles),
-            nameof(FierHubConfig.Records),
-            nameof(FierHubConfig.ConnectionStrings),
-            nameof(FierHubConfig.UseDbConfigFromFierhub),
-            nameof(FierHubConfig.UseTokenSecretFromFierhub),
-            nameof(FierHubConfig.IsFierhubDataLoadingCompleted),
-            nameof(FierHubConfig.ConfiguredFromFierhub),
-            nameof(FierHubConfig.AdditionalConfiguration)
-        };
-
-        private static JToken ConfigurationSectionToJToken(IConfigurationSection section)
-        {
-            if (section == null) return null;
-            var children = section.GetChildren().ToList();
-            if (!children.Any())
-            {
-                return section.Value != null ? JValue.CreateString(section.Value) : JValue.CreateNull();
-            }
-
-            bool isArray = children.All(c => int.TryParse(c.Key, out _));
-            if (isArray)
-            {
-                var jArray = new JArray();
-                foreach (var child in children.OrderBy(c => int.Parse(c.Key)))
-                {
-                    jArray.Add(ConfigurationSectionToJToken(child));
-                }
-                return jArray;
-            }
-            else
-            {
-                var jObj = new JObject();
-                foreach (var child in children)
-                {
-                    jObj[child.Key] = ConfigurationSectionToJToken(child);
-                }
-                return jObj;
-            }
         }
 
         #region JWTTOKEN_AND_JSON_CONFIGURATION
@@ -311,25 +346,25 @@ namespace Fierhub.Service.Library.Service
         private void RegisterJWTTokenService(string key)
         {
             _builder.Services.AddAuthentication(x =>
+            {
+                x.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                x.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+            })
+            .AddJwtBearer(x =>
+            {
+                x.SaveToken = true;
+                x.RequireHttpsMetadata = false;
+                x.TokenValidationParameters = new TokenValidationParameters
                 {
-                    x.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-                    x.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-                })
-                            .AddJwtBearer(x =>
-                            {
-                                x.SaveToken = true;
-                                x.RequireHttpsMetadata = false;
-                                x.TokenValidationParameters = new TokenValidationParameters
-                                {
-                                    ValidateIssuer = false,
-                                    ValidateAudience = false,
-                                    ValidateLifetime = true,
-                                    ValidateIssuerSigningKey = true,
-                                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(key)),
-                                    ClockSkew = TimeSpan.FromSeconds(5),
-                                    RoleClaimType = FierhubConstants.Roles
-                                };
-                            });
+                    ValidateIssuer = false,
+                    ValidateAudience = false,
+                    ValidateLifetime = true,
+                    ValidateIssuerSigningKey = true,
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(key)),
+                    ClockSkew = TimeSpan.FromSeconds(5),
+                    RoleClaimType = FierhubConstants.Roles
+                };
+            });
         }
 
         private void RegisterJsonHandler()
@@ -337,13 +372,10 @@ namespace Fierhub.Service.Library.Service
             _builder.Services.AddControllers().AddNewtonsoftJson(options =>
             {
                 options.SerializerSettings.ReferenceLoopHandling = ReferenceLoopHandling.Ignore;
-                // This makes property names PascalCase globally
                 options.SerializerSettings.ContractResolver = new DefaultContractResolver
                 {
-                    NamingStrategy = null // null → PascalCase (use C# property names as-is)
+                    NamingStrategy = null
                 };
-
-                // Optional: allow camelCase JSON input to map to PascalCase model
                 options.SerializerSettings.MetadataPropertyHandling = MetadataPropertyHandling.Ignore;
             });
 

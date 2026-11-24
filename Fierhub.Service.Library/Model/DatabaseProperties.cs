@@ -17,7 +17,7 @@
         public int MinPoolSize { get; set; }
         public int MaxPoolSize { get; set; }
         public bool Pooling { get; set; }
-        public string BuildConnectionString()
+        public string GetConnection()
         {
             return $"server={Server};port={Port};database={Database};User Id={UserId};password={Password};Connection Timeout={ConnectionTimeout};Connection Lifetime={ConnectionLifetime};Min Pool Size={MinPoolSize};Max Pool Size={MaxPoolSize};Pooling={Pooling};";
         }

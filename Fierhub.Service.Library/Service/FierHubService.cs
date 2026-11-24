@@ -47,7 +47,7 @@ namespace Fierhub.Service.Library.Service
 
             ResponseModel responseModel = await _fierhubServiceRequest.GetRequestAsync<ResponseModel>(
                 "https://www.fierhub.com/api/fileContent/getConfigFile/" + fileCode,
-                Map.Of("Authorization", _fierHubConfig.Configuration.Token)
+                Map.Of("Authorization", _fierHubConfig.Token)
             );
 
             var content = JsonConvert.DeserializeObject<T>((string)responseModel!.responseBody!)!;
@@ -66,7 +66,7 @@ namespace Fierhub.Service.Library.Service
             if (userId != null) claims.Add(FierhubConstants.UserId, userId);
             if (roles != null) claims.Add(FierhubConstants.Roles, roles.Aggregate((x, y) => x + "," + y));
 
-            var jwtSecret = _fierHubConfig.Secrets.Find(x => x.IsPrimary);
+            var jwtSecret = _fierHubConfig.JwtSecret ?? throw new InvalidOperationException("JwtSecret is not configured.");
             TokenRequestBody tokenRequestBody = new TokenRequestBody
             {
                 Claims = claims,

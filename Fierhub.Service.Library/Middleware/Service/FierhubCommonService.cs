@@ -17,7 +17,7 @@ namespace Fierhub.Service.Library.Middleware.Service
 
             var handler = new JwtSecurityTokenHandler();
 
-            var jwtConfig = fierHubConfig.Secrets?.FirstOrDefault(x => x.IsPrimary)
+            var jwtConfig = fierHubConfig.JwtSecret
                 ?? throw new Exception("Primary JWT config not found");
 
             try
@@ -74,7 +74,7 @@ namespace Fierhub.Service.Library.Middleware.Service
 
             var handler = new JwtSecurityTokenHandler();
 
-            var jwtConfig = fierHubConfig.Secrets?.FirstOrDefault(x => x.IsPrimary)
+            var jwtConfig = fierHubConfig.JwtSecret
                 ?? throw new Exception("Primary JWT config not found");
 
             try
